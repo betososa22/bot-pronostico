@@ -30,4 +30,4 @@ jobs:
           API_FOOTBALL_KEY: "510811e125a60b7e0caba0690fdd6874"
           SEASON_HIST: "2023"
         run: |
-          python run_once.py
+          python pronosticos.py

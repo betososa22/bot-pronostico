@@ -24,8 +24,12 @@ SEASON_HIST = int(os.getenv("SEASON_HIST", "2025"))
 LAST_N = 10
 HALF_LIFE = 5  # recencia (reservado para futuros usos)
 
-# Nuevo: controla cuántos días hacia adelante consultar (0 = solo hoy, 1 = hoy+mañana)
+# Rango de días a consultar (0 = solo hoy; 1 = hoy+mañana)
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "1"))
+
+# Nuevo: ocultar partidos de HOY que ya pasaron (o están por arrancar ya mismo)
+SKIP_PAST_TODAY = os.getenv("SKIP_PAST_TODAY", "1") == "1"
+PAST_BUFFER_MIN = int(os.getenv("PAST_BUFFER_MIN", "0"))  # margen adicional
 
 # =======================
 # Ligas permitidas
@@ -48,7 +52,7 @@ def es_liga_permitida(league_id: int) -> bool:
 RATE_SEM = asyncio.Semaphore(2)
 async_client: httpx.AsyncClient | None = None  # será asignado en main()
 
-# Cache simple para evitar repetir llamadas a /fixtures/statistics
+# Cache simple para /fixtures/statistics
 _STATS_CACHE: Dict[int, Any] = {}
 
 async def safe_get_async(path: str, params=None, max_retries=5):
@@ -73,10 +77,13 @@ async def safe_get_async(path: str, params=None, max_retries=5):
 # =======================
 # Utilidades
 # =======================
-def iso_to_bogota_str(iso_str: str) -> str:
+def iso_to_bogota_dt(iso_str: str) -> datetime:
+    """Convierte ISO utc/‘Z’ a datetime en zona Bogotá."""
     dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    local_dt = dt.astimezone(BOGOTA_TZ)
-    return local_dt.strftime("%H:%M")
+    return dt.astimezone(BOGOTA_TZ)
+
+def iso_to_bogota_str(iso_str: str) -> str:
+    return iso_to_bogota_dt(iso_str).strftime("%H:%M")
 
 async def tg_send_text(text: str):
     """Envía texto a Telegram (se corta en bloques si es largo)."""
@@ -198,7 +205,6 @@ async def promedio_global(team_id: int, season: int) -> Tuple[float, int]:
 # Estadísticas por fixture (tarjetas y corners)
 # =======================
 def _extract_cards_from_statistics_block(block: Dict[str, Any]) -> Tuple[int, int]:
-    """Recibe un bloque con 'statistics' y devuelve (yellow, red)."""
     yellow = 0
     red = 0
     for item in block.get("statistics", []):
@@ -213,7 +219,6 @@ def _extract_cards_from_statistics_block(block: Dict[str, Any]) -> Tuple[int, in
     return yellow, red
 
 def _extract_corners_from_statistics_block(block: Dict[str, Any]) -> int:
-    """Devuelve la cantidad de 'Corner Kicks' del bloque."""
     for item in block.get("statistics", []):
         t = item.get("type")
         v = item.get("value")
@@ -222,7 +227,6 @@ def _extract_corners_from_statistics_block(block: Dict[str, Any]) -> int:
     return 0
 
 async def _fetch_fixture_statistics(fixture_id: int):
-    """Obtiene y cachea /fixtures/statistics?fixture=ID."""
     if fixture_id in _STATS_CACHE:
         return _STATS_CACHE[fixture_id]
     r = await safe_get_async("/fixtures/statistics", params={"fixture": fixture_id})
@@ -234,18 +238,12 @@ async def _fetch_fixture_statistics(fixture_id: int):
 # Promedios de tarjetas
 # =======================
 async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, float, int]:
-    """
-    Devuelve (prom_amarillas, prom_rojas, prom_total, n_partidos_con_dato)
-    en los últimos LAST_N partidos terminados del equipo en la temporada dada.
-    """
     rows = await _fetch_team_fixtures_season(team_id, season)
     fx_ids = _last10_fixture_ids_from_year_end(rows, team_id, season)
     if not fx_ids:
         return 0.0, 0.0, 0.0, 0
-
-    total_y, total_r, count = 0, 0, 0
+    total_y = total_r = count = 0
     stats_list = await asyncio.gather(*[_fetch_fixture_statistics(fid) for fid in fx_ids])
-
     for stats in stats_list:
         block = None
         for b in stats or []:
@@ -259,30 +257,23 @@ async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, fl
         total_y += y
         total_r += r
         count += 1
-
     if count == 0:
         return 0.0, 0.0, 0.0, 0
-
     prom_y = round(total_y / count, 2)
     prom_r = round(total_r / count, 2)
-    prom_t = round((total_y + total_r) / count, 2)  # total = amarillas + rojas (peso 1 cada una)
+    prom_t = round((total_y + total_r) / count, 2)  # roja = 1 (ajusta si la quieres 2)
     return prom_y, prom_r, prom_t, count
 
 # =======================
 # Promedios de corners
 # =======================
 async def promedio_corners(team_id: int, season: int) -> Tuple[float, int]:
-    """
-    Devuelve (prom_corners, n_partidos_con_dato) para los últimos LAST_N partidos terminados.
-    """
     rows = await _fetch_team_fixtures_season(team_id, season)
     fx_ids = _last10_fixture_ids_from_year_end(rows, team_id, season)
     if not fx_ids:
         return 0.0, 0
-
-    total_c, count = 0, 0
+    total_c = count = 0
     stats_list = await asyncio.gather(*[_fetch_fixture_statistics(fid) for fid in fx_ids])
-
     for stats in stats_list:
         block = None
         for b in stats or []:
@@ -292,10 +283,8 @@ async def promedio_corners(team_id: int, season: int) -> Tuple[float, int]:
                 break
         if not block:
             continue
-        c = _extract_corners_from_statistics_block(block)
-        total_c += c
+        total_c += _extract_corners_from_statistics_block(block)
         count += 1
-
     if count == 0:
         return 0.0, 0
     return round(total_c / count, 2), count
@@ -304,13 +293,28 @@ async def promedio_corners(team_id: int, season: int) -> Tuple[float, int]:
 # Main: construir y enviar mensaje(s)
 # =======================
 async def build_and_send():
-    fechas = fechas_consulta(DAYS_AHEAD)  # p.ej.: ["2025-08-23", "2025-08-24"]
+    fechas = fechas_consulta(DAYS_AHEAD)
     bloques_totales = []
+
+    now_bo = datetime.now(BOGOTA_TZ)
+    cutoff = now_bo + timedelta(minutes=PAST_BUFFER_MIN)
+    hoy_str = now_bo.date().strftime("%Y-%m-%d")
 
     for fecha in fechas:
         partidos = await fixtures_por_fecha(fecha)
+
+        # Filtro: si es HOY y está activado, solo partidos cuyo kickoff >= ahora(+buffer)
+        if fecha == hoy_str and SKIP_PAST_TODAY:
+            partidos = [
+                p for p in partidos
+                if iso_to_bogota_dt(p["fecha_iso"]) >= cutoff
+            ]
+
         if not partidos:
-            bloques_totales.append(f"📭 No hay partidos para **{fecha}** en las ligas permitidas.")
+            if fecha == hoy_str and SKIP_PAST_TODAY:
+                bloques_totales.append(f"📭 Para **{fecha}** no quedan partidos por jugar (o entran en {PAST_BUFFER_MIN} min).")
+            else:
+                bloques_totales.append(f"📭 No hay partidos para **{fecha}** en las ligas permitidas.")
             continue
 
         bloques = []
@@ -349,7 +353,7 @@ async def build_and_send():
                 msg.append(f"💡 Sugerencia: **{lado}**")
 
             bloques.append("\n".join(msg))
-            await asyncio.sleep(0.12)
+            await asyncio.sleep(0.1)
 
         header = f"📅 **{fecha}**"
         bloques_totales.append(header + "\n" + "\n\n".join(bloques))

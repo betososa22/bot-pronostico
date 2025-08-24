@@ -179,7 +179,6 @@ def _last10_fixture_ids_from_year_end(rows, team_id: int, season: int, max_j=LAS
         fx_id = ((f.get("fixture") or {}).get("id"))
         if not isinstance(fx_id, int):
             continue
-        # Solo agregamos si el equipo participó como local o visitante
         home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
         away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
         if home_id == team_id or away_id == team_id:
@@ -196,7 +195,7 @@ async def promedio_global(team_id: int, season: int) -> Tuple[float, int]:
     return round(sum(goles)/len(goles), 2), len(goles)
 
 # =======================
-# Promedios de tarjetas (amarillas, rojas, total)
+# Estadísticas por fixture (tarjetas y corners)
 # =======================
 def _extract_cards_from_statistics_block(block: Dict[str, Any]) -> Tuple[int, int]:
     """Recibe un bloque con 'statistics' y devuelve (yellow, red)."""
@@ -206,13 +205,21 @@ def _extract_cards_from_statistics_block(block: Dict[str, Any]) -> Tuple[int, in
         t = item.get("type")
         v = item.get("value")
         if v is None or isinstance(v, str):
-            # Algunos providers ponen "-" o None; lo tratamos como 0
             continue
         if t == "Yellow Cards":
             yellow = int(v)
         elif t == "Red Cards":
             red = int(v)
     return yellow, red
+
+def _extract_corners_from_statistics_block(block: Dict[str, Any]) -> int:
+    """Devuelve la cantidad de 'Corner Kicks' del bloque."""
+    for item in block.get("statistics", []):
+        t = item.get("type")
+        v = item.get("value")
+        if t == "Corner Kicks" and v is not None and not isinstance(v, str):
+            return int(v)
+    return 0
 
 async def _fetch_fixture_statistics(fixture_id: int):
     """Obtiene y cachea /fixtures/statistics?fixture=ID."""
@@ -223,6 +230,9 @@ async def _fetch_fixture_statistics(fixture_id: int):
     _STATS_CACHE[fixture_id] = data
     return data
 
+# =======================
+# Promedios de tarjetas
+# =======================
 async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, float, int]:
     """
     Devuelve (prom_amarillas, prom_rojas, prom_total, n_partidos_con_dato)
@@ -234,12 +244,9 @@ async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, fl
         return 0.0, 0.0, 0.0, 0
 
     total_y, total_r, count = 0, 0, 0
-    # Podemos paralelizar moderadamente respetando RATE_SEM
-    coros = [_fetch_fixture_statistics(fid) for fid in fx_ids]
-    stats_list = await asyncio.gather(*coros, return_exceptions=False)
+    stats_list = await asyncio.gather(*[_fetch_fixture_statistics(fid) for fid in fx_ids])
 
     for stats in stats_list:
-        # 'stats' es una lista de dos bloques (home y away), cada uno con 'team' y 'statistics'
         block = None
         for b in stats or []:
             team = b.get("team") or {}
@@ -249,7 +256,6 @@ async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, fl
         if not block:
             continue
         y, r = _extract_cards_from_statistics_block(block)
-        # Contabilizamos aunque sean 0; si no hubo dato (None/"-"), ya se filtró
         total_y += y
         total_r += r
         count += 1
@@ -261,6 +267,38 @@ async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, fl
     prom_r = round(total_r / count, 2)
     prom_t = round((total_y + total_r) / count, 2)  # total = amarillas + rojas (peso 1 cada una)
     return prom_y, prom_r, prom_t, count
+
+# =======================
+# Promedios de corners
+# =======================
+async def promedio_corners(team_id: int, season: int) -> Tuple[float, int]:
+    """
+    Devuelve (prom_corners, n_partidos_con_dato) para los últimos LAST_N partidos terminados.
+    """
+    rows = await _fetch_team_fixtures_season(team_id, season)
+    fx_ids = _last10_fixture_ids_from_year_end(rows, team_id, season)
+    if not fx_ids:
+        return 0.0, 0
+
+    total_c, count = 0, 0
+    stats_list = await asyncio.gather(*[_fetch_fixture_statistics(fid) for fid in fx_ids])
+
+    for stats in stats_list:
+        block = None
+        for b in stats or []:
+            team = b.get("team") or {}
+            if team.get("id") == team_id:
+                block = b
+                break
+        if not block:
+            continue
+        c = _extract_corners_from_statistics_block(block)
+        total_c += c
+        count += 1
+
+    if count == 0:
+        return 0.0, 0
+    return round(total_c / count, 2), count
 
 # =======================
 # Main: construir y enviar mensaje(s)
@@ -282,9 +320,13 @@ async def build_and_send():
             promV_gf, nV_gf = await promedio_global(p["visitante_id"], SEASON_HIST)
             total_estimado = round(promL_gf + promV_gf, 2) if nL_gf and nV_gf else None
 
-            # Promedios de Tarjetas (amarillas, rojas, total)
+            # Promedios de Tarjetas
             promL_y, promL_r, promL_t, nL_cards = await promedio_tarjetas(p["local_id"], SEASON_HIST)
             promV_y, promV_r, promV_t, nV_cards = await promedio_tarjetas(p["visitante_id"], SEASON_HIST)
+
+            # Promedios de Corners
+            promL_c, nL_c = await promedio_corners(p["local_id"], SEASON_HIST)
+            promV_c, nV_c = await promedio_corners(p["visitante_id"], SEASON_HIST)
 
             hora_local = iso_to_bogota_str(p["fecha_iso"])
 
@@ -297,6 +339,9 @@ async def build_and_send():
                 f"🟨🟥 Promedios de tarjetas últimos {LAST_N}:",
                 f"  - {p['local_name']}: {promL_y} 🟨 | {promL_r} 🟥 | {promL_t} tot.  (n={nL_cards})",
                 f"  - {p['visitante_name']}: {promV_y} 🟨 | {promV_r} 🟥 | {promV_t} tot.  (n={nV_cards})",
+                f"🚩 Promedios de corners últimos {LAST_N}:",
+                f"  - {p['local_name']}: {promL_c} (n={nL_c})",
+                f"  - {p['visitante_name']}: {promV_c} (n={nV_c})",
             ]
             if total_estimado is not None:
                 lado = "Over 2.5" if total_estimado >= 2.5 else "Under 2.5"
@@ -304,7 +349,7 @@ async def build_and_send():
                 msg.append(f"💡 Sugerencia: **{lado}**")
 
             bloques.append("\n".join(msg))
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.12)
 
         header = f"📅 **{fecha}**"
         bloques_totales.append(header + "\n" + "\n\n".join(bloques))

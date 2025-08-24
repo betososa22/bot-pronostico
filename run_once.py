@@ -17,14 +17,14 @@ if not BOT_TOKEN or not API_FOOTBALL_KEY or not CHAT_ID:
     raise SystemExit("❌ Faltan BOT_TOKEN y/o API_FOOTBALL_KEY y/o CHAT_ID.")
 
 BASE_URL = "https://v3.football.api-sports.io"
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOGOTA_TZ = pytz.timezone("America/Bogota")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SEASON_HIST = int(os.getenv("SEASON_HIST", "2023"))
 LAST_N = 10
-HALF_LIFE = 5  # recencia (no usado de momento, pero conservado)
+HALF_LIFE = 5  # recencia (reservado para futuros usos)
 
-# Nuevo: controla cuántos días hacia adelante consultar (0 = solo hoy)
+# Nuevo: controla cuántos días hacia adelante consultar (0 = solo hoy, 1 = hoy+mañana)
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "1"))
 
 # =======================
@@ -43,16 +43,15 @@ def es_liga_permitida(league_id: int) -> bool:
     return league_id in ALLOWED_LEAGUE_IDS
 
 # =======================
-# Cliente HTTP asíncrono
+# Estado global (cliente HTTP y control de tasa)
 # =======================
 RATE_SEM = asyncio.Semaphore(2)
-async_client = httpx.AsyncClient(
-    base_url=BASE_URL,
-    headers={"x-apisports-key": API_FOOTBALL_KEY, "Accept": "application/json"},
-    timeout=15.0,
-)
+async_client: httpx.AsyncClient | None = None  # será asignado en main()
 
 async def safe_get_async(path: str, params=None, max_retries=5):
+    """GET con reintentos y control de tasa usando el cliente global."""
+    if async_client is None:
+        raise RuntimeError("El cliente HTTP no está inicializado.")
     params = params or {}
     async with RATE_SEM:
         for attempt in range(1, max_retries + 1):
@@ -71,7 +70,7 @@ async def safe_get_async(path: str, params=None, max_retries=5):
 # =======================
 # Utilidades
 # =======================
-def iso_to_bogota_str(iso_str):
+def iso_to_bogota_str(iso_str: str) -> str:
     dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     local_dt = dt.astimezone(BOGOTA_TZ)
     return local_dt.strftime("%H:%M")
@@ -94,8 +93,8 @@ async def tg_send_text(text: str):
             await c.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": CHAT_ID, "text": b})
             await asyncio.sleep(0.3)
 
-def fechas_consulta(dias_ahead: int):
-    """Devuelve lista de fechas YYYY-MM-DD desde hoy hasta hoy + dias_ahead (zona Bogotá)."""
+def fechas_consulta(dias_ahead: int) -> list[str]:
+    """Lista de fechas YYYY-MM-DD desde hoy hasta hoy + dias_ahead (zona Bogotá)."""
     hoy = datetime.now(BOGOTA_TZ).date()
     return [(hoy + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(dias_ahead + 1)]
 
@@ -171,10 +170,10 @@ async def promedio_global(team_id: int, season: int):
     return round(sum(goles)/len(goles), 2), len(goles)
 
 # =======================
-# Main: construir mensaje
+# Main: construir y enviar mensaje(s)
 # =======================
 async def build_and_send():
-    fechas = fechas_consulta(DAYS_AHEAD)  # ej: ["2025-08-23", "2025-08-24"]
+    fechas = fechas_consulta(DAYS_AHEAD)  # p.ej.: ["2025-08-23", "2025-08-24"]
     bloques_totales = []
 
     for fecha in fechas:
@@ -207,14 +206,24 @@ async def build_and_send():
         header = f"📅 **{fecha}**"
         bloques_totales.append(header + "\n" + "\n\n".join(bloques))
 
-    header_global = f"🤖 Pronósticos automáticos — Rango {fechas[0]} a {fechas[-1]}\n" \
-                    f"(Ligas: {', '.join(ALLOWED_LEAGUE_IDS.values())})"
+    header_global = (
+        f"🤖 Pronósticos automáticos — Rango {fechas[0]} a {fechas[-1]}\n"
+        f"(Ligas: {', '.join(ALLOWED_LEAGUE_IDS.values())})"
+    )
     await tg_send_text(header_global + "\n\n" + "\n\n".join(bloques_totales))
 
+# =======================
+# Entry point (cliente HTTP con contexto)
+# =======================
+async def main():
+    global async_client
+    async with httpx.AsyncClient(
+        base_url=BASE_URL,
+        headers={"x-apisports-key": API_FOOTBALL_KEY, "Accept": "application/json"},
+        timeout=15.0,
+    ) as client:
+        async_client = client
+        await build_and_send()
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(build_and_send())
-    finally:
-        # Cierra el cliente HTTP global de forma explícita
-        if not async_client.is_closed:
-            asyncio.get_event_loop().run_until_complete(async_client.aclose())
+    asyncio.run(main())

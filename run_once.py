@@ -33,9 +33,9 @@ DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "1"))
 ALLOWED_LEAGUE_IDS = {
     239: "Liga BetPlay Dimayor (COL)",  # Colombia - Primera A
     39:  "Premier League (ENG)",        # Inglaterra
-    78:  "Bundesliga (GER)",            # Alemania
-    61:  "Ligue 1 (FRA)",               # Francia
-    135: "Serie A (ITA)",               # Italia
+    #78:  "Bundesliga (GER)",            # Alemania
+    #61:  "Ligue 1 (FRA)",               # Francia
+    #135: "Serie A (ITA)",               # Italia
     140: "La Liga (ESP)",               # España
 }
 

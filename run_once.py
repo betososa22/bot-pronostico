@@ -4,7 +4,7 @@ import time
 import random
 import asyncio
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pytz
 
 # =======================
@@ -22,7 +22,10 @@ BOGOTA_TZ = pytz.timezone("America/Bogota")
 
 SEASON_HIST = int(os.getenv("SEASON_HIST", "2023"))
 LAST_N = 10
-HALF_LIFE = 5  # recencia
+HALF_LIFE = 5  # recencia (no usado de momento, pero conservado)
+
+# Nuevo: controla cuántos días hacia adelante consultar (0 = solo hoy)
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "1"))
 
 # =======================
 # Ligas permitidas
@@ -90,6 +93,11 @@ async def tg_send_text(text: str):
         for b in blocks:
             await c.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": CHAT_ID, "text": b})
             await asyncio.sleep(0.3)
+
+def fechas_consulta(dias_ahead: int):
+    """Devuelve lista de fechas YYYY-MM-DD desde hoy hasta hoy + dias_ahead (zona Bogotá)."""
+    hoy = datetime.now(BOGOTA_TZ).date()
+    return [(hoy + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(dias_ahead + 1)]
 
 # =======================
 # Datos de fixtures
@@ -166,36 +174,47 @@ async def promedio_global(team_id: int, season: int):
 # Main: construir mensaje
 # =======================
 async def build_and_send():
-    fecha = datetime.now(BOGOTA_TZ).strftime("%Y-%m-%d")
-    partidos = await fixtures_por_fecha(fecha)
-    if not partidos:
-        await tg_send_text(f"📭 No hay partidos para hoy ({fecha}) en las ligas permitidas.")
-        return
+    fechas = fechas_consulta(DAYS_AHEAD)  # ej: ["2025-08-23", "2025-08-24"]
+    bloques_totales = []
 
-    bloques = []
-    for p in partidos:
-        promL, nL = await promedio_global(p["local_id"], SEASON_HIST)
-        promV, nV = await promedio_global(p["visitante_id"], SEASON_HIST)
-        total_estimado = round(promL + promV, 2) if nL and nV else None
-        hora_local = iso_to_bogota_str(p["fecha_iso"])
+    for fecha in fechas:
+        partidos = await fixtures_por_fecha(fecha)
+        if not partidos:
+            bloques_totales.append(f"📭 No hay partidos para **{fecha}** en las ligas permitidas.")
+            continue
 
-        msg = [
-            f"📅 {fecha} ⏰ {hora_local} - 🏆 {p['liga']}",
-            f"⚽ {p['local_name']} vs {p['visitante_name']}",
-            f"📊 Promedios GF últimos {LAST_N} (Temp {SEASON_HIST}):",
-            f"  - {p['local_name']}: {promL} GF/partido",
-            f"  - {p['visitante_name']}: {promV} GF/partido",
-        ]
-        if total_estimado:
-            lado = "Over 2.5" if total_estimado >= 2.5 else "Under 2.5"
-            msg.append(f"🔢 Total estimado: **{total_estimado}** goles")
-            msg.append(f"💡 Sugerencia: **{lado}**")
-        bloques.append("\n".join(msg))
-        await asyncio.sleep(0.2)
+        bloques = []
+        for p in partidos:
+            promL, nL = await promedio_global(p["local_id"], SEASON_HIST)
+            promV, nV = await promedio_global(p["visitante_id"], SEASON_HIST)
+            total_estimado = round(promL + promV, 2) if nL and nV else None
+            hora_local = iso_to_bogota_str(p["fecha_iso"])
 
-    header = f"🤖 Pronósticos automáticos — {fecha}\n(Ligas: {', '.join(ALLOWED_LEAGUE_IDS.values())})"
-    await tg_send_text(header + "\n\n" + "\n\n".join(bloques))
+            msg = [
+                f"⏰ {hora_local} — 🏆 {p['liga']}",
+                f"⚽ {p['local_name']} vs {p['visitante_name']}",
+                f"📊 Promedios GF últimos {LAST_N} (Temp {SEASON_HIST}):",
+                f"  - {p['local_name']}: {promL} GF/partido",
+                f"  - {p['visitante_name']}: {promV} GF/partido",
+            ]
+            if total_estimado is not None:
+                lado = "Over 2.5" if total_estimado >= 2.5 else "Under 2.5"
+                msg.append(f"🔢 Total estimado: **{total_estimado}** goles")
+                msg.append(f"💡 Sugerencia: **{lado}**")
+            bloques.append("\n".join(msg))
+            await asyncio.sleep(0.2)
+
+        header = f"📅 **{fecha}**"
+        bloques_totales.append(header + "\n" + "\n\n".join(bloques))
+
+    header_global = f"🤖 Pronósticos automáticos — Rango {fechas[0]} a {fechas[-1]}\n" \
+                    f"(Ligas: {', '.join(ALLOWED_LEAGUE_IDS.values())})"
+    await tg_send_text(header_global + "\n\n" + "\n\n".join(bloques_totales))
 
 if __name__ == "__main__":
-    asyncio.run(build_and_send())
-
+    try:
+        asyncio.run(build_and_send())
+    finally:
+        # Cierra el cliente HTTP global de forma explícita
+        if not async_client.is_closed:
+            asyncio.get_event_loop().run_until_complete(async_client.aclose())

@@ -31,4 +31,4 @@ jobs:
           CHAT_ID: "5428115279"
           SEASON_HIST: "2023"
         run: |
-          python pronosticos.py
+          python run_once.py

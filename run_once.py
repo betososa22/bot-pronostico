@@ -20,7 +20,7 @@ BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA_TZ = pytz.timezone("America/Bogota")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-SEASON_HIST = int(os.getenv("SEASON_HIST", "2023"))
+SEASON_HIST = int(os.getenv("SEASON_HIST", "2025"))
 LAST_N = 10
 HALF_LIFE = 5  # recencia (reservado para futuros usos)
 

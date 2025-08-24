@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
-import time
 import random
 import asyncio
 import httpx
 from datetime import datetime, timedelta, timezone
 import pytz
+from typing import Tuple, List, Dict, Any
 
 # =======================
 # Configuración
@@ -47,6 +47,9 @@ def es_liga_permitida(league_id: int) -> bool:
 # =======================
 RATE_SEM = asyncio.Semaphore(2)
 async_client: httpx.AsyncClient | None = None  # será asignado en main()
+
+# Cache simple para evitar repetir llamadas a /fixtures/statistics
+_STATS_CACHE: Dict[int, Any] = {}
 
 async def safe_get_async(path: str, params=None, max_retries=5):
     """GET con reintentos y control de tasa usando el cliente global."""
@@ -122,7 +125,7 @@ async def fixtures_por_fecha(fecha_iso_yyyy_mm_dd: str):
     return salida
 
 # =======================
-# Historial y promedios
+# Historial y promedios (goles)
 # =======================
 _FINISHED_STATES = {"FT", "AET", "PEN"}
 
@@ -143,6 +146,7 @@ def _extract_goals_from_fixture(fx):
     return None, None
 
 def _last10_from_year_end(rows, team_id: int, season: int, max_j=LAST_N):
+    """Devuelve últimos partidos terminados (≤ fin de temporada) con GF del equipo."""
     end_ts = int(datetime(season, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp())
     eligibles = []
     for f in rows:
@@ -161,13 +165,102 @@ def _last10_from_year_end(rows, team_id: int, season: int, max_j=LAST_N):
     eligibles.sort(key=lambda x: x[0], reverse=True)
     return eligibles[:max_j]
 
-async def promedio_global(team_id: int, season: int):
+def _last10_fixture_ids_from_year_end(rows, team_id: int, season: int, max_j=LAST_N) -> List[int]:
+    """Devuelve los fixture_id de los últimos partidos terminados del equipo."""
+    end_ts = int(datetime(season, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp())
+    eligibles = []
+    for f in rows:
+        status = ((f.get("fixture") or {}).get("status") or {}).get("short")
+        if status not in _FINISHED_STATES:
+            continue
+        ts = ((f.get("fixture") or {}).get("timestamp")) or 0
+        if not ts or ts > end_ts:
+            continue
+        fx_id = ((f.get("fixture") or {}).get("id"))
+        if not isinstance(fx_id, int):
+            continue
+        # Solo agregamos si el equipo participó como local o visitante
+        home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
+        away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
+        if home_id == team_id or away_id == team_id:
+            eligibles.append((ts, fx_id))
+    eligibles.sort(key=lambda x: x[0], reverse=True)
+    return [fx_id for _, fx_id in eligibles[:max_j]]
+
+async def promedio_global(team_id: int, season: int) -> Tuple[float, int]:
     rows = await _fetch_team_fixtures_season(team_id, season)
     last10 = _last10_from_year_end(rows, team_id, season)
     if not last10:
         return 0.0, 0
     goles = [gf for (_, _, gf) in last10]
     return round(sum(goles)/len(goles), 2), len(goles)
+
+# =======================
+# Promedios de tarjetas (amarillas, rojas, total)
+# =======================
+def _extract_cards_from_statistics_block(block: Dict[str, Any]) -> Tuple[int, int]:
+    """Recibe un bloque con 'statistics' y devuelve (yellow, red)."""
+    yellow = 0
+    red = 0
+    for item in block.get("statistics", []):
+        t = item.get("type")
+        v = item.get("value")
+        if v is None or isinstance(v, str):
+            # Algunos providers ponen "-" o None; lo tratamos como 0
+            continue
+        if t == "Yellow Cards":
+            yellow = int(v)
+        elif t == "Red Cards":
+            red = int(v)
+    return yellow, red
+
+async def _fetch_fixture_statistics(fixture_id: int):
+    """Obtiene y cachea /fixtures/statistics?fixture=ID."""
+    if fixture_id in _STATS_CACHE:
+        return _STATS_CACHE[fixture_id]
+    r = await safe_get_async("/fixtures/statistics", params={"fixture": fixture_id})
+    data = (r.json() or {}).get("response", []) if r else []
+    _STATS_CACHE[fixture_id] = data
+    return data
+
+async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, float, int]:
+    """
+    Devuelve (prom_amarillas, prom_rojas, prom_total, n_partidos_con_dato)
+    en los últimos LAST_N partidos terminados del equipo en la temporada dada.
+    """
+    rows = await _fetch_team_fixtures_season(team_id, season)
+    fx_ids = _last10_fixture_ids_from_year_end(rows, team_id, season)
+    if not fx_ids:
+        return 0.0, 0.0, 0.0, 0
+
+    total_y, total_r, count = 0, 0, 0
+    # Podemos paralelizar moderadamente respetando RATE_SEM
+    coros = [_fetch_fixture_statistics(fid) for fid in fx_ids]
+    stats_list = await asyncio.gather(*coros, return_exceptions=False)
+
+    for stats in stats_list:
+        # 'stats' es una lista de dos bloques (home y away), cada uno con 'team' y 'statistics'
+        block = None
+        for b in stats or []:
+            team = b.get("team") or {}
+            if team.get("id") == team_id:
+                block = b
+                break
+        if not block:
+            continue
+        y, r = _extract_cards_from_statistics_block(block)
+        # Contabilizamos aunque sean 0; si no hubo dato (None/"-"), ya se filtró
+        total_y += y
+        total_r += r
+        count += 1
+
+    if count == 0:
+        return 0.0, 0.0, 0.0, 0
+
+    prom_y = round(total_y / count, 2)
+    prom_r = round(total_r / count, 2)
+    prom_t = round((total_y + total_r) / count, 2)  # total = amarillas + rojas (peso 1 cada una)
+    return prom_y, prom_r, prom_t, count
 
 # =======================
 # Main: construir y enviar mensaje(s)
@@ -184,24 +277,34 @@ async def build_and_send():
 
         bloques = []
         for p in partidos:
-            promL, nL = await promedio_global(p["local_id"], SEASON_HIST)
-            promV, nV = await promedio_global(p["visitante_id"], SEASON_HIST)
-            total_estimado = round(promL + promV, 2) if nL and nV else None
+            # Promedios de Goles
+            promL_gf, nL_gf = await promedio_global(p["local_id"], SEASON_HIST)
+            promV_gf, nV_gf = await promedio_global(p["visitante_id"], SEASON_HIST)
+            total_estimado = round(promL_gf + promV_gf, 2) if nL_gf and nV_gf else None
+
+            # Promedios de Tarjetas (amarillas, rojas, total)
+            promL_y, promL_r, promL_t, nL_cards = await promedio_tarjetas(p["local_id"], SEASON_HIST)
+            promV_y, promV_r, promV_t, nV_cards = await promedio_tarjetas(p["visitante_id"], SEASON_HIST)
+
             hora_local = iso_to_bogota_str(p["fecha_iso"])
 
             msg = [
                 f"⏰ {hora_local} — 🏆 {p['liga']}",
                 f"⚽ {p['local_name']} vs {p['visitante_name']}",
                 f"📊 Promedios GF últimos {LAST_N} (Temp {SEASON_HIST}):",
-                f"  - {p['local_name']}: {promL} GF/partido",
-                f"  - {p['visitante_name']}: {promV} GF/partido",
+                f"  - {p['local_name']}: {promL_gf} GF/partido",
+                f"  - {p['visitante_name']}: {promV_gf} GF/partido",
+                f"🟨🟥 Promedios de tarjetas últimos {LAST_N}:",
+                f"  - {p['local_name']}: {promL_y} 🟨 | {promL_r} 🟥 | {promL_t} tot.  (n={nL_cards})",
+                f"  - {p['visitante_name']}: {promV_y} 🟨 | {promV_r} 🟥 | {promV_t} tot.  (n={nV_cards})",
             ]
             if total_estimado is not None:
                 lado = "Over 2.5" if total_estimado >= 2.5 else "Under 2.5"
-                msg.append(f"🔢 Total estimado: **{total_estimado}** goles")
+                msg.append(f"🔢 Total estimado (goles): **{total_estimado}**")
                 msg.append(f"💡 Sugerencia: **{lado}**")
+
             bloques.append("\n".join(msg))
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
 
         header = f"📅 **{fecha}**"
         bloques_totales.append(header + "\n" + "\n\n".join(bloques))

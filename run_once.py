@@ -27,36 +27,36 @@ HALF_LIFE = 5  # recencia (reservado para futuros usos)
 # Rango de días a consultar (0 = solo hoy; 1 = hoy+mañana)
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "1"))
 
-# Nuevo: ocultar partidos de HOY que ya pasaron (o están por arrancar ya mismo)
+# Ocultar partidos de HOY que ya pasaron (o arrancan de inmediato)
 SKIP_PAST_TODAY = os.getenv("SKIP_PAST_TODAY", "1") == "1"
-PAST_BUFFER_MIN = int(os.getenv("PAST_BUFFER_MIN", "0"))  # margen adicional
+PAST_BUFFER_MIN = int(os.getenv("PAST_BUFFER_MIN", "0"))
 
 # =======================
 # Ligas permitidas
 # =======================
 ALLOWED_LEAGUE_IDS = {
-    239: "Liga BetPlay Dimayor (COL)",  # Colombia - Primera A
-    39:  "Premier League (ENG)",        # Inglaterra
-    #78:  "Bundesliga (GER)",            # Alemania
-    #61:  "Ligue 1 (FRA)",               # Francia
-    #135: "Serie A (ITA)",               # Italia
-    140: "La Liga (ESP)",               # España
+    239: "Liga BetPlay Dimayor (COL)",
+    39:  "Premier League (ENG)",
+    #78:  "Bundesliga (GER)",
+    #61:  "Ligue 1 (FRA)",
+    #135: "Serie A (ITA)",
+    140: "La Liga (ESP)",
 }
 
 def es_liga_permitida(league_id: int) -> bool:
     return league_id in ALLOWED_LEAGUE_IDS
 
 # =======================
-# Estado global (cliente HTTP y control de tasa)
+# Estado global (HTTP y rate limit)
 # =======================
 RATE_SEM = asyncio.Semaphore(2)
 async_client: httpx.AsyncClient | None = None  # será asignado en main()
 
-# Cache simple para /fixtures/statistics
-_STATS_CACHE: Dict[int, Any] = {}
+# Caches simples
+_STATS_CACHE: Dict[int, Any] = {}        # fixture_id -> /fixtures/statistics
+_PRED_CACHE: Dict[int, Any] = {}         # fixture_id -> /predictions
 
 async def safe_get_async(path: str, params=None, max_retries=5):
-    """GET con reintentos y control de tasa usando el cliente global."""
     if async_client is None:
         raise RuntimeError("El cliente HTTP no está inicializado.")
     params = params or {}
@@ -78,7 +78,6 @@ async def safe_get_async(path: str, params=None, max_retries=5):
 # Utilidades
 # =======================
 def iso_to_bogota_dt(iso_str: str) -> datetime:
-    """Convierte ISO utc/‘Z’ a datetime en zona Bogotá."""
     dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     return dt.astimezone(BOGOTA_TZ)
 
@@ -86,7 +85,6 @@ def iso_to_bogota_str(iso_str: str) -> str:
     return iso_to_bogota_dt(iso_str).strftime("%H:%M")
 
 async def tg_send_text(text: str):
-    """Envía texto a Telegram (se corta en bloques si es largo)."""
     max_len = 3800
     blocks, cur = [], ""
     for line in text.split("\n"):
@@ -104,12 +102,11 @@ async def tg_send_text(text: str):
             await asyncio.sleep(0.3)
 
 def fechas_consulta(dias_ahead: int) -> list[str]:
-    """Lista de fechas YYYY-MM-DD desde hoy hasta hoy + dias_ahead (zona Bogotá)."""
     hoy = datetime.now(BOGOTA_TZ).date()
     return [(hoy + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(dias_ahead + 1)]
 
 # =======================
-# Datos de fixtures
+# Datos de fixtures (día)
 # =======================
 async def fixtures_por_fecha(fecha_iso_yyyy_mm_dd: str):
     r = await safe_get_async("/fixtures", params={"date": fecha_iso_yyyy_mm_dd, "timezone": "America/Bogota"})
@@ -132,7 +129,7 @@ async def fixtures_por_fecha(fecha_iso_yyyy_mm_dd: str):
     return salida
 
 # =======================
-# Historial y promedios (goles)
+# Historial y promedios (goles y forma)
 # =======================
 _FINISHED_STATES = {"FT", "AET", "PEN"}
 
@@ -152,8 +149,12 @@ def _extract_goals_from_fixture(fx):
         return gh, ga
     return None, None
 
-def _last10_from_year_end(rows, team_id: int, season: int, max_j=LAST_N):
-    """Devuelve últimos partidos terminados (≤ fin de temporada) con GF del equipo."""
+def _last_from_year_end(rows, team_id: int, season: int, max_j=LAST_N):
+    """
+    Devuelve lista (ts, fixture_id, is_home, gf, ga, result) de partidos TERMINADOS,
+    ordenada desc por ts, tope max_j.
+    result ∈ {"W","D","L"} desde la perspectiva del team_id.
+    """
     end_ts = int(datetime(season, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp())
     eligibles = []
     for f in rows:
@@ -166,40 +167,55 @@ def _last10_from_year_end(rows, team_id: int, season: int, max_j=LAST_N):
         gh, ga = _extract_goals_from_fixture(f)
         if gh is None or ga is None:
             continue
-        is_home = ((f.get("teams") or {}).get("home") or {}).get("id") == team_id
-        gf_equipo = gh if is_home else ga
-        eligibles.append((ts, is_home, gf_equipo))
+        home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
+        away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
+        if home_id != team_id and away_id != team_id:
+            continue
+        is_home = (home_id == team_id)
+        gf = gh if is_home else ga
+        gc = ga if is_home else gh
+        if gf > gc:
+            res = "W"
+        elif gf == gc:
+            res = "D"
+        else:
+            res = "L"
+        fx_id = ((f.get("fixture") or {}).get("id"))
+        eligibles.append((ts, fx_id, is_home, gf, gc, res))
     eligibles.sort(key=lambda x: x[0], reverse=True)
     return eligibles[:max_j]
 
-def _last10_fixture_ids_from_year_end(rows, team_id: int, season: int, max_j=LAST_N) -> List[int]:
-    """Devuelve los fixture_id de los últimos partidos terminados del equipo."""
-    end_ts = int(datetime(season, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp())
-    eligibles = []
-    for f in rows:
-        status = ((f.get("fixture") or {}).get("status") or {}).get("short")
-        if status not in _FINISHED_STATES:
-            continue
-        ts = ((f.get("fixture") or {}).get("timestamp")) or 0
-        if not ts or ts > end_ts:
-            continue
-        fx_id = ((f.get("fixture") or {}).get("id"))
-        if not isinstance(fx_id, int):
-            continue
-        home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
-        away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
-        if home_id == team_id or away_id == team_id:
-            eligibles.append((ts, fx_id))
-    eligibles.sort(key=lambda x: x[0], reverse=True)
-    return [fx_id for _, fx_id in eligibles[:max_j]]
+async def _recent_subset(team_id: int, season: int, want_home: bool) -> List[tuple]:
+    """Últimos partidos terminados del equipo en la temporada, filtrados por local/visitante."""
+    rows = await _fetch_team_fixtures_season(team_id, season)
+    latest = _last_from_year_end(rows, team_id, season, LAST_N * 2)  # margen por si faltan de esa condición
+    subset = [e for e in latest if e[2] == want_home][:LAST_N]
+    return subset
 
 async def promedio_global(team_id: int, season: int) -> Tuple[float, int]:
     rows = await _fetch_team_fixtures_season(team_id, season)
-    last10 = _last10_from_year_end(rows, team_id, season)
+    last10 = _last_from_year_end(rows, team_id, season, LAST_N)
     if not last10:
         return 0.0, 0
-    goles = [gf for (_, _, gf) in last10]
+    goles = [gf for (_, _, _, gf, _, _) in last10]
     return round(sum(goles)/len(goles), 2), len(goles)
+
+async def forma_condicional(team_id: int, season: int, want_home: bool) -> Tuple[int,int,int,float,float,float,int]:
+    """
+    Estadísticas condicionadas a local/visitante (según want_home):
+    devuelve (W, D, L, win_pct, gf_avg, gc_avg, n)
+    """
+    subset = await _recent_subset(team_id, season, want_home)
+    n = len(subset)
+    if n == 0:
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0
+    w = sum(1 for e in subset if e[5] == "W")
+    d = sum(1 for e in subset if e[5] == "D")
+    l = sum(1 for e in subset if e[5] == "L")
+    gf_avg = round(sum(e[3] for e in subset)/n, 2)
+    gc_avg = round(sum(e[4] for e in subset)/n, 2)
+    win_pct = round(100.0 * w / n, 1)
+    return w, d, l, win_pct, gf_avg, gc_avg, n
 
 # =======================
 # Estadísticas por fixture (tarjetas y corners)
@@ -239,7 +255,8 @@ async def _fetch_fixture_statistics(fixture_id: int):
 # =======================
 async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, float, int]:
     rows = await _fetch_team_fixtures_season(team_id, season)
-    fx_ids = _last10_fixture_ids_from_year_end(rows, team_id, season)
+    fx_list = _last_from_year_end(rows, team_id, season, LAST_N)
+    fx_ids = [e[1] for e in fx_list]
     if not fx_ids:
         return 0.0, 0.0, 0.0, 0
     total_y = total_r = count = 0
@@ -261,7 +278,7 @@ async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, fl
         return 0.0, 0.0, 0.0, 0
     prom_y = round(total_y / count, 2)
     prom_r = round(total_r / count, 2)
-    prom_t = round((total_y + total_r) / count, 2)  # roja = 1 (ajusta si la quieres 2)
+    prom_t = round((total_y + total_r) / count, 2)  # roja pesa 1; cambia a +2*r si quieres roja=2
     return prom_y, prom_r, prom_t, count
 
 # =======================
@@ -269,7 +286,8 @@ async def promedio_tarjetas(team_id: int, season: int) -> Tuple[float, float, fl
 # =======================
 async def promedio_corners(team_id: int, season: int) -> Tuple[float, int]:
     rows = await _fetch_team_fixtures_season(team_id, season)
-    fx_ids = _last10_fixture_ids_from_year_end(rows, team_id, season)
+    fx_list = _last_from_year_end(rows, team_id, season, LAST_N)
+    fx_ids = [e[1] for e in fx_list]
     if not fx_ids:
         return 0.0, 0
     total_c = count = 0
@@ -290,6 +308,46 @@ async def promedio_corners(team_id: int, season: int) -> Tuple[float, int]:
     return round(total_c / count, 2), count
 
 # =======================
+# Predicciones API-Football
+# =======================
+async def fetch_predictions(fixture_id: int) -> Dict[str, Any]:
+    """Devuelve {'home':'%','draw':'%','away':'%','advice':str,'winner_name':str} si disponible."""
+    if fixture_id in _PRED_CACHE:
+        return _PRED_CACHE[fixture_id]
+    r = await safe_get_async("/predictions", params={"fixture": fixture_id})
+    perc_home = perc_draw = perc_away = None
+    advice = None
+    winner_name = None
+    if r:
+        resp = (r.json() or {}).get("response", [])
+        if resp:
+            item = resp[0]  # estructura puede variar levemente según plan
+            # percent puede venir en item['predictions']['percent'] o en item['percent']
+            percent = None
+            if isinstance(item.get("predictions"), dict):
+                percent = item["predictions"].get("percent") or item["predictions"].get("win_or_draw")
+                w = item["predictions"].get("winner")
+                if isinstance(w, dict):
+                    winner_name = w.get("name")
+                advice = item["predictions"].get("advice") or item.get("advice")
+            if percent is None:
+                percent = item.get("percent")
+                w = item.get("winner")
+                if isinstance(w, dict):
+                    winner_name = w.get("name")
+                advice = item.get("advice")
+            if isinstance(percent, dict):
+                perc_home = percent.get("home")
+                perc_draw = percent.get("draw")
+                perc_away = percent.get("away")
+    data = {
+        "home": perc_home, "draw": perc_draw, "away": perc_away,
+        "advice": advice, "winner_name": winner_name
+    }
+    _PRED_CACHE[fixture_id] = data
+    return data
+
+# =======================
 # Main: construir y enviar mensaje(s)
 # =======================
 async def build_and_send():
@@ -303,12 +361,8 @@ async def build_and_send():
     for fecha in fechas:
         partidos = await fixtures_por_fecha(fecha)
 
-        # Filtro: si es HOY y está activado, solo partidos cuyo kickoff >= ahora(+buffer)
         if fecha == hoy_str and SKIP_PAST_TODAY:
-            partidos = [
-                p for p in partidos
-                if iso_to_bogota_dt(p["fecha_iso"]) >= cutoff
-            ]
+            partidos = [p for p in partidos if iso_to_bogota_dt(p["fecha_iso"]) >= cutoff]
 
         if not partidos:
             if fecha == hoy_str and SKIP_PAST_TODAY:
@@ -324,26 +378,34 @@ async def build_and_send():
             promV_gf, nV_gf = await promedio_global(p["visitante_id"], SEASON_HIST)
             total_estimado = round(promL_gf + promV_gf, 2) if nL_gf and nV_gf else None
 
-            # Promedios de Tarjetas
+            # Forma condicionada (local para el local, visitante para el visitante)
+            wL, dL, lL, winL, gfL, gcL, nL_form = await forma_condicional(p["local_id"], SEASON_HIST, want_home=True)
+            wV, dV, lV, winV, gfV, gcV, nV_form = await forma_condicional(p["visitante_id"], SEASON_HIST, want_home=False)
+
+            # Tarjetas y corners
             promL_y, promL_r, promL_t, nL_cards = await promedio_tarjetas(p["local_id"], SEASON_HIST)
             promV_y, promV_r, promV_t, nV_cards = await promedio_tarjetas(p["visitante_id"], SEASON_HIST)
-
-            # Promedios de Corners
             promL_c, nL_c = await promedio_corners(p["local_id"], SEASON_HIST)
             promV_c, nV_c = await promedio_corners(p["visitante_id"], SEASON_HIST)
+
+            # Predicción API
+            pred = await fetch_predictions(p["fixture_id"])
 
             hora_local = iso_to_bogota_str(p["fecha_iso"])
 
             msg = [
                 f"⏰ {hora_local} — 🏆 {p['liga']}",
                 f"⚽ {p['local_name']} vs {p['visitante_name']}",
-                f"📊 Promedios GF últimos {LAST_N} (Temp {SEASON_HIST}):",
+                f"📊 Goles ultimos 10 {LAST_N} (Temp {SEASON_HIST}):",
                 f"  - {p['local_name']}: {promL_gf} GF/partido",
                 f"  - {p['visitante_name']}: {promV_gf} GF/partido",
-                f"🟨🟥 Promedios de tarjetas últimos {LAST_N}:",
+                f"📈 Forma condicional últimos {LAST_N}:",
+                f"  - 🏠 {p['local_name']}: {wL}-{dL}-{lL} ({winL}%) | GF {gfL} • GC {gcL}  (n={nL_form})",
+                f"  - 🧳 {p['visitante_name']}: {wV}-{dV}-{lV} ({winV}%) | GF {gfV} • GC {gcV}  (n={nV_form})",
+                f"🟨🟥 Tarjetas (últ {LAST_N}):",
                 f"  - {p['local_name']}: {promL_y} 🟨 | {promL_r} 🟥 | {promL_t} tot.  (n={nL_cards})",
                 f"  - {p['visitante_name']}: {promV_y} 🟨 | {promV_r} 🟥 | {promV_t} tot.  (n={nV_cards})",
-                f"🚩 Promedios de corners últimos {LAST_N}:",
+                f"🚩 Corners (últ {LAST_N}):",
                 f"  - {p['local_name']}: {promL_c} (n={nL_c})",
                 f"  - {p['visitante_name']}: {promV_c} (n={nV_c})",
             ]
@@ -351,6 +413,19 @@ async def build_and_send():
                 lado = "Over 2.5" if total_estimado >= 2.5 else "Under 2.5"
                 msg.append(f"🔢 Total estimado (goles): **{total_estimado}**")
                 msg.append(f"💡 Sugerencia: **{lado}**")
+
+            # Bloque de predicción oficial (si viene)
+            if any(pred.get(k) for k in ("home","draw","away","advice","winner_name")):
+                line_pct = []
+                if pred.get("home"): line_pct.append(f"Local {pred['home']}")
+                if pred.get("draw"): line_pct.append(f"Empate {pred['draw']}")
+                if pred.get("away"): line_pct.append(f"Visitante {pred['away']}")
+                if line_pct:
+                    msg.append("📊 Predicción API: " + " | ".join(line_pct))
+                if pred.get("advice"):
+                    msg.append(f"🧠 Consejo API: {pred['advice']}")
+                elif pred.get("winner_name"):
+                    msg.append(f"🧠 Consejo API: Winner → {pred['winner_name']}")
 
             bloques.append("\n".join(msg))
             await asyncio.sleep(0.1)
@@ -365,7 +440,7 @@ async def build_and_send():
     await tg_send_text(header_global + "\n\n" + "\n\n".join(bloques_totales))
 
 # =======================
-# Entry point (cliente HTTP con contexto)
+# Entry point
 # =======================
 async def main():
     global async_client

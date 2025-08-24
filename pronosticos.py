@@ -33,7 +33,7 @@ HALF_LIFE = 5         # media-vida para recencia (None para desactivar)
 # =======================
 ALLOWED_LEAGUE_IDS = {
     239: "Liga BetPlay Dimayor (COL)",  # Colombia - Primera A
-    #140: "La Liga (ESP)",               # España - Primera División
+    140: "La Liga (ESP)",               # España - Primera División
     #39:  "Premier League (ENG)",        # Inglaterra
     #78:  "Bundesliga (GER)",            # Alemania
     #61:  "Ligue 1 (FRA)",               # Francia

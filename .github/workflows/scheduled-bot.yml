@@ -26,8 +26,8 @@ jobs:
 
       - name: Run once (send pronosticos)
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          BOT_TOKEN: "7500570637:AAEWH2Bdw8STZGoobHfabRpy_DOwwgLjTMY"
+          API_FOOTBALL_KEY: "510811e125a60b7e0caba0690fdd6874"
           CHAT_ID: ${{ secrets.CHAT_ID }}
           SEASON_HIST: "2023"
         run: |

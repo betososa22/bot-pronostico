@@ -2,8 +2,8 @@ name: Scheduled Pronosticos
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # 07:00 America/Bogota
-    - cron: "0 19 * * *"   # 14:00 America/Bogota
+    - cron: "0 17 * * *"   # 07:00 America/Bogota
+    - cron: "0 03 * * *"   # 14:00 America/Bogota
   workflow_dispatch: {}     # permitir correrlo manualmente
 
 jobs:

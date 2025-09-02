@@ -39,7 +39,7 @@ PAST_BUFFER_MIN = int(os.getenv("PAST_BUFFER_MIN", "0"))
 # =======================
 ALLOWED_LEAGUE_IDS = {
     239: "Liga BetPlay Dimayor (COL)",
-    241: "Copa Colombia"
+    241: "Copa Colombia",
     39:  "Premier League (ENG)",
     140: "La Liga (ESP)",
     71:  "Brasileirão (BRA)",

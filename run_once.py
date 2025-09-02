@@ -39,6 +39,7 @@ PAST_BUFFER_MIN = int(os.getenv("PAST_BUFFER_MIN", "0"))
 # =======================
 ALLOWED_LEAGUE_IDS = {
     239: "Liga BetPlay Dimayor (COL)",
+    241: "Copa Colombia"
     39:  "Premier League (ENG)",
     140: "La Liga (ESP)",
     71:  "Brasileirão (BRA)",
@@ -47,6 +48,8 @@ ALLOWED_LEAGUE_IDS = {
     3:   "Europa League",             
     78:  "Bundesliga (GER)", 
     61:  "Ligue 1 (FRA)", 
+    34:  "Eliminatorias Sudaca",
+    32:  "Eliminatorias Europa"
 }
 
 def es_liga_permitida(league_id: int) -> bool:

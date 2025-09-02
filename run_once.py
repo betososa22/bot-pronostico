@@ -24,13 +24,8 @@ SEASON_HIST = int(os.getenv("SEASON_HIST", "2025"))
 LAST_N = 10
 HALF_LIFE = 5  # reservado
 
-# === NUEVO: controlar si solo queremos el día siguiente ===
-NEXT_DAY_ONLY = os.getenv("NEXT_DAY_ONLY", "1") == "1"
-
-# Rango de días a consultar (si NEXT_DAY_ONLY=1, se ignora y solo se usa mañana)
-DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "1"))
-
-# Ocultar partidos de HOY que ya pasaron (si se usara HOY)
+# === AJUSTE: siempre HOY + MAÑANA ===
+# Si quieres evitar incluir partidos de hoy ya iniciados o recién iniciados, usa:
 SKIP_PAST_TODAY = os.getenv("SKIP_PAST_TODAY", "1") == "1"
 PAST_BUFFER_MIN = int(os.getenv("PAST_BUFFER_MIN", "0"))
 
@@ -43,11 +38,11 @@ ALLOWED_LEAGUE_IDS = {
     39:  "Premier League (ENG)",
     140: "La Liga (ESP)",
     71:  "Brasileirão (BRA)",
-    135: "Serie A (ITA)",              
-    2:   "Champions League",         
-    3:   "Europa League",             
-    78:  "Bundesliga (GER)", 
-    61:  "Ligue 1 (FRA)", 
+    135: "Serie A (ITA)",
+    2:   "Champions League",
+    3:   "Europa League",
+    78:  "Bundesliga (GER)",
+    61:  "Ligue 1 (FRA)",
     34:  "Eliminatorias Sudaca",
     32:  "Eliminatorias Europa"
 }
@@ -110,13 +105,13 @@ async def tg_send_text(text: str):
             await c.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": CHAT_ID, "text": b})
             await asyncio.sleep(0.3)
 
-def fechas_consulta(dias_ahead: int) -> list[str]:
+def fechas_consulta() -> List[str]:
+    """
+    Devuelve siempre las fechas de HOY y MAÑANA en hora de Bogotá (YYYY-MM-DD).
+    """
     hoy = datetime.now(BOGOTA_TZ).date()
-    if NEXT_DAY_ONLY:
-        # Solo el día siguiente
-        return [(hoy + timedelta(days=1)).strftime("%Y-%m-%d")]
-    # Hoy + los siguientes N días
-    return [(hoy + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(dias_ahead + 1)]
+    maniana = hoy + timedelta(days=1)
+    return [hoy.strftime("%Y-%m-%d"), maniana.strftime("%Y-%m-%d")]
 
 # =======================
 # Datos de fixtures (día)
@@ -352,7 +347,7 @@ async def fetch_predictions(fixture_id: int) -> Dict[str, Any]:
 # Main: construir y enviar mensaje(s)
 # =======================
 async def build_and_send():
-    fechas = fechas_consulta(DAYS_AHEAD)
+    fechas = fechas_consulta()
     bloques_totales = []
 
     now_bo = datetime.now(BOGOTA_TZ)
@@ -362,12 +357,12 @@ async def build_and_send():
     for fecha in fechas:
         partidos = await fixtures_por_fecha(fecha)
 
-        # Si estamos usando HOY, se puede filtrar según SKIP_PAST_TODAY
-        if (fecha == hoy_str) and SKIP_PAST_TODAY and not NEXT_DAY_ONLY:
+        # Si es HOY y queremos saltarnos los que ya pasaron (o que están a punto de empezar)
+        if fecha == hoy_str and SKIP_PAST_TODAY:
             partidos = [p for p in partidos if iso_to_bogota_dt(p["fecha_iso"]) >= cutoff]
 
         if not partidos:
-            if fecha == hoy_str and SKIP_PAST_TODAY and not NEXT_DAY_ONLY:
+            if fecha == hoy_str and SKIP_PAST_TODAY:
                 bloques_totales.append(f"📭 Para **{fecha}** no quedan partidos por jugar (o entran en {PAST_BUFFER_MIN} min).")
             else:
                 bloques_totales.append(f"📭 No hay partidos para **{fecha}** en las ligas permitidas.")
